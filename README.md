@@ -1,0 +1,1 @@
+# Chrome-Freezing-Slowdown-Speed-Doctor
