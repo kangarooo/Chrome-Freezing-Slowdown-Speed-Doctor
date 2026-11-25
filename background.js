@@ -529,127 +529,239 @@ async function waitForTabLoad(tabId, timeoutMs) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// DEEP SCAN — differential per-extension RAM + load time measurement
+// DEEP SCAN — 4-phase differential measurement per extension
 //
-// Method: for each enabled extension, disable it, reload a test page, measure
-// heap + load time, re-enable. Delta vs all-enabled baseline = true cost of
-// that extension. Takes ~5-6s per extension.
+// For each extension:
+//   Phase A (Idle)    — system RAM with extension on, no test tab
+//   Phase B (Loading) — CDP CPU% during page load + heap at load end + load time
+//   Phase C (Active)  — heap after settle (RAM during active use)
+//   Phase D (Closed)  — system RAM 2s after tab close (memory retained/leaked)
+//
+// Each phase run TWICE: once with extension ON, once with it OFF.
+// Delta = ON minus OFF = true cost of that extension for that phase.
 // ═══════════════════════════════════════════════════════════════════════════════
 async function runDeepScan(port) {
-  const TEST_URL = 'https://www.google.com';
-  const SETTLE_MS = 1200;   // wait after load for content scripts to settle
-  const RELOAD_WAIT = 6000; // max time to wait for page load per iteration
-
   const send = m => { try { port.postMessage(m); } catch(e) {} };
-  const allItems = await getAllItems();
-  const targets = allItems.filter(i => i.enabled && i.type !== 'theme');
 
-  if (targets.length === 0) {
-    send({ type: 'done', result: { items: [], baseline: null, error: 'No enabled extensions found.' } });
+  // Receive config from popup (testUrl sent with 'start_scan' message)
+  // We wait for it via port first message
+  let testUrl = 'https://tvnet.lv';
+  let cancelled = false;
+  port.onDisconnect.addListener(() => { cancelled = true; });
+  port.onMessage.addListener(m => { if (m && m.type === 'cancel') cancelled = true; });
+  const msgPromise = new Promise(resolve => {
+    const handler = msg => { if (msg.type === 'config') { testUrl = msg.testUrl || testUrl; resolve(); } };
+    port.onMessage.addListener(handler);
+    // Timeout fallback — start anyway after 2s if no config received
+    setTimeout(resolve, 2000);
+  });
+  await msgPromise;
+
+  const LOAD_WAIT   = 8000; // max wait for page load
+  const SETTLE_MS   = 1500; // wait after load for scripts to settle
+  const CPU_SAMPLE  = 2500; // ms to hold CDP open and sample CPU during load
+  const POST_CLOSE  = 2000; // ms to wait after tab close before measuring retained RAM
+
+  const allItems = await getAllItems();
+  const targets  = allItems.filter(i => i.enabled && i.type !== 'theme');
+
+  if (!targets.length) {
+    send({ type: 'done', result: { items: [], testUrl, error: 'No enabled extensions found.' } });
     return;
   }
 
-  send({ type: 'start', total: targets.length });
+  send({ type: 'start', total: targets.length, testUrl });
 
-  // ── Step 1: open a persistent test tab ───────────────────────────────────
-  send({ type: 'status', text: '📂 Opening test tab…', progress: 0 });
-  const testTab = await new Promise(r => chrome.tabs.create({ url: TEST_URL, active: false }, r));
-  await waitForTabLoad(testTab.id, RELOAD_WAIT);
-  await sleep(SETTLE_MS);
+  // ── Helpers ──────────────────────────────────────────────────────────────
 
-  // ── Step 2: baseline measurement — all extensions enabled ────────────────
-  send({ type: 'status', text: '📊 Measuring baseline (all extensions on)…', progress: 0 });
-  const baseline = await measureTabSnapshot(testTab.id);
+  async function getSystemRAMFree() {
+    return new Promise(r => chrome.system?.memory
+      ? chrome.system.memory.getInfo(info => r(info ? info.availableCapacity : null))
+      : r(null));
+  }
 
-  // ── Step 3: iterate — disable one, reload, measure, re-enable ────────────
-  const results = [];
-  for (let i = 0; i < targets.length; i++) {
-    const item = targets[i];
-    const pct = Math.round(((i + 1) / targets.length) * 100);
+  async function measurePhases(withLabel) {
+    // Phase A: idle RAM (no test tab)
+    const ramBefore = await getSystemRAMFree();
 
-    send({
-      type: 'status',
-      text: `🔍 Testing "${item.name}" (${i+1}/${targets.length})…`,
-      progress: pct,
-      currentItem: { id: item.id, name: item.name, icons: item.icons, type: item.type },
-      itemIndex: i,
-      itemTotal: targets.length
-    });
+    // Phase B+C: open tab, load URL, measure during load and after settle
+    const tab = await new Promise(r => chrome.tabs.create({ url: testUrl, active: false }, r));
 
-    // Disable the extension
-    await new Promise(r => chrome.management.setEnabled(item.id, false, r));
-    await sleep(300); // small settle before reload
+    // Start CDP snapshot for CPU during load
+    let cpuDuringLoad = null;
+    const cdpTarget = { tabId: tab.id };
+    let cdpAttached = false;
+    try {
+      await cdpAttach(cdpTarget);
+      cdpAttached = true;
+      await cdpSend(cdpTarget, 'Performance.enable', { timeDomain: 'threadTicks' });
+    } catch(e) { cdpAttached = false; }
 
-    // Reload test tab
-    await new Promise(r => chrome.tabs.reload(testTab.id, { bypassCache: true }, r));
-    await waitForTabLoad(testTab.id, RELOAD_WAIT);
+    const cpuSnap1 = cdpAttached ? await (async () => {
+      try {
+        const { metrics } = await cdpSend(cdpTarget, 'Performance.getMetrics');
+        const m = {}; metrics.forEach(x => m[x.name] = x.value); return m;
+      } catch(e) { return null; }
+    })() : null;
+
+    const loadStart = Date.now();
+    await waitForTabLoad(tab.id, LOAD_WAIT);
+    const loadTimeMs = Date.now() - loadStart;
     await sleep(SETTLE_MS);
 
-    // Measure without this extension
-    const snap = await measureTabSnapshot(testTab.id);
+    // Phase B: CPU during load (CDP delta)
+    const cpuSnap2 = cdpAttached ? await (async () => {
+      try {
+        const { metrics } = await cdpSend(cdpTarget, 'Performance.getMetrics');
+        const m = {}; metrics.forEach(x => m[x.name] = x.value); return m;
+      } catch(e) { return null; }
+    })() : null;
+    if (cdpAttached) await cdpDetach(cdpTarget);
 
-    // Re-enable the extension
-    await new Promise(r => chrome.management.setEnabled(item.id, true, r));
-    await sleep(200);
+    let cpuPct = null;
+    if (cpuSnap1 && cpuSnap2) {
+      const elapsed = Math.max(loadTimeMs + SETTLE_MS, 1000);
+      const cpuMs = ((cpuSnap2.ProcessCPUTime || 0) - (cpuSnap1.ProcessCPUTime || 0)) * 1000;
+      cpuPct = Math.min(100, Math.max(0, Math.round((cpuMs / elapsed) * 100)));
+    }
 
-    // Compute deltas (positive = extension cost, negative = extension helped)
-    const heapDelta   = baseline.heap  != null && snap.heap  != null ? baseline.heap  - snap.heap  : null;
-    const loadDelta   = baseline.load  != null && snap.load  != null ? baseline.load  - snap.load  : null;
-    const scriptDelta = baseline.extScripts != null && snap.extScripts != null
-      ? baseline.extScripts - snap.extScripts : null;
+    // Phase B: heap at end of load + injected scripts
+    const loadSnap = await (async () => {
+      try {
+        const res = await chrome.scripting.executeScript({
+          target: { tabId: tab.id },
+          func: () => {
+            const nav = performance.getEntriesByType('navigation')[0];
+            const resources = performance.getEntriesByType('resource');
+            return {
+              heap: performance.memory ? performance.memory.usedJSHeapSize : null,
+              loadTime: nav ? Math.round(nav.loadEventEnd - nav.startTime) : null,
+              scriptCount: resources.filter(r => r.name.startsWith('chrome-extension://')).length,
+              scriptMs: Math.round(resources.filter(r => r.name.startsWith('chrome-extension://')).reduce((s,r) => s + r.duration, 0)),
+            };
+          }
+        });
+        return res?.[0]?.result || {};
+      } catch(e) { return {}; }
+    })();
 
-    results.push({
+    // Phase C: heap after settle (active use RAM)
+    await sleep(SETTLE_MS);
+    const activeHeap = await (async () => {
+      try {
+        const res = await chrome.scripting.executeScript({
+          target: { tabId: tab.id },
+          func: () => performance.memory ? performance.memory.usedJSHeapSize : null
+        });
+        return res?.[0]?.result ?? null;
+      } catch(e) { return null; }
+    })();
+
+    // Phase D: close tab and measure retained RAM
+    await new Promise(r => chrome.tabs.remove(tab.id, r));
+    await sleep(POST_CLOSE);
+    const ramAfter = await getSystemRAMFree();
+
+    return {
+      label:        withLabel,
+      // Phase A
+      ramIdleBytes: ramBefore,
+      // Phase B
+      loadTimeMs:   loadSnap.loadTime || loadTimeMs,
+      heapAtLoadBytes: loadSnap.heap ?? null,
+      cpuDuringLoadPct: cpuPct,
+      scriptCount:  loadSnap.scriptCount ?? 0,
+      scriptMs:     loadSnap.scriptMs ?? 0,
+      // Phase C
+      heapActiveBytes: activeHeap,
+      // Phase D
+      ramAfterBytes: ramAfter,
+      ramRetainedBytes: (ramBefore != null && ramAfter != null) ? ramBefore - ramAfter : null,
+    };
+  }
+
+  // ── Run per-extension ─────────────────────────────────────────────────────
+  const results = [];
+
+  try {
+  for (let i = 0; i < targets.length; i++) {
+    if (cancelled) break;
+    const item = targets[i];
+    const pct  = Math.round(((i + 1) / targets.length) * 100);
+
+    // Phase: measure WITH extension enabled
+    send({ type: 'status', progress: pct,
+      text: `🟢 "${item.name}" (${i+1}/${targets.length}) — measuring WITH extension…` });
+    const withExt = await measurePhases('with');
+
+    if (cancelled) break;
+    // Disable extension (recorded so it is restored even if the worker dies)
+    await chrome.storage.local.set({ ds_disabled_id: item.id });
+    await new Promise(r => chrome.management.setEnabled(item.id, false, () => { void chrome.runtime.lastError; r(); }));
+    await sleep(400);
+
+    // Phase: measure WITHOUT extension
+    send({ type: 'status', progress: pct,
+      text: `⭕ "${item.name}" (${i+1}/${targets.length}) — measuring WITHOUT extension…` });
+    const withoutExt = await measurePhases('without');
+
+    // Re-enable
+    await new Promise(r => chrome.management.setEnabled(item.id, true, () => { void chrome.runtime.lastError; r(); }));
+    await chrome.storage.local.remove('ds_disabled_id');
+    await sleep(300);
+
+    // ── Compute deltas per phase category ──────────────────────────────────
+    const d = (a, b) => (a != null && b != null) ? a - b : null;
+    const dMB = (a, b) => { const v = d(a, b); return v != null ? Math.round(v / 1024 / 1024 * 10) / 10 : null; };
+
+    const result = {
       id: item.id, name: item.name, icons: item.icons, type: item.type,
       permissions: item.permissions||[], hostPermissions: item.hostPermissions||[],
-      // Raw measurements
-      heapWithout:   snap.heap,
-      heapBaseline:  baseline.heap,
-      loadWithout:   snap.load,
-      loadBaseline:  baseline.load,
-      // Deltas: positive means the extension ADDS this cost
-      heapDeltaBytes: heapDelta,
-      loadDeltaMs:    loadDelta,
-      scriptDeltaMs:  scriptDelta,
-      // Derived MB
-      heapDeltaMB: heapDelta != null ? heapDelta / 1024 / 1024 : null,
-    });
 
-    send({ type: 'item_done', item: results[results.length - 1], progress: pct });
+      // ── Raw with/without ──
+      with: withExt,
+      without: withoutExt,
+
+      // ── Phase A: Idle impact ──
+      // How much system RAM is used just by having the extension enabled (no tab open)
+      idleRamDeltaMB: dMB(withoutExt.ramIdleBytes, withExt.ramIdleBytes), // positive = ext uses RAM at idle
+
+      // ── Phase B: Load impact ──
+      // Cost DURING page loading
+      loadTimeDeltaMs:   d(withExt.loadTimeMs, withoutExt.loadTimeMs),       // +ms = ext slows load
+      loadHeapDeltaMB:   dMB(withExt.heapAtLoadBytes, withoutExt.heapAtLoadBytes), // +MB = ext adds heap at load
+      loadCpuDeltaPct:   d(withExt.cpuDuringLoadPct, withoutExt.cpuDuringLoadPct), // +% = ext uses more CPU loading
+      scriptCountDelta:  d(withExt.scriptCount, withoutExt.scriptCount),     // how many scripts ext injected
+      scriptMsDelta:     d(withExt.scriptMs, withoutExt.scriptMs),           // ms of script execution added
+
+      // ── Phase C: Active impact ──
+      // RAM cost while page is open and in use
+      activeHeapDeltaMB: dMB(withExt.heapActiveBytes, withoutExt.heapActiveBytes), // +MB = ext uses more RAM actively
+
+      // ── Phase D: Close impact (memory leak indicator) ──
+      // How much RAM the system did NOT recover after tab closed
+      retainedRamDeltaMB: dMB(withoutExt.ramRetainedBytes, withExt.ramRetainedBytes), // +MB = ext leaks RAM after close
+    };
+
+    results.push(result);
+    send({ type: 'item_done', item: result, progress: pct });
+  }
+  } finally {
+    // Safety net: never leave an extension disabled
+    const { ds_disabled_id } = await chrome.storage.local.get('ds_disabled_id');
+    if (ds_disabled_id) {
+      await new Promise(r => chrome.management.setEnabled(ds_disabled_id, true, () => { void chrome.runtime.lastError; r(); }));
+      await chrome.storage.local.remove('ds_disabled_id');
+    }
   }
 
-  // ── Step 4: close test tab ────────────────────────────────────────────────
-  send({ type: 'status', text: '✅ Deep scan complete — closing tab…', progress: 100 });
-  await new Promise(r => chrome.tabs.remove(testTab.id, r));
+  // Sort by total impact score
+  results.sort((a, b) => {
+    const score = r => Math.abs(r.loadTimeDeltaMs||0)/100 + Math.abs(r.activeHeapDeltaMB||0)*2 + Math.abs(r.loadCpuDeltaPct||0);
+    return score(b) - score(a);
+  });
 
-  // Sort by heap impact descending
-  results.sort((a, b) => (b.heapDeltaBytes||0) - (a.heapDeltaBytes||0));
-
-  send({ type: 'done', result: { items: results, baseline } });
-}
-
-// Snapshot heap + load time + extension script count in a tab
-async function measureTabSnapshot(tabId) {
-  try {
-    const res = await chrome.scripting.executeScript({
-      target: { tabId },
-      func: () => {
-        const nav = performance.getEntriesByType('navigation')[0];
-        const loadTime = nav ? Math.round(nav.loadEventEnd - nav.startTime) : null;
-        const heap = performance.memory ? performance.memory.usedJSHeapSize : null;
-        const resources = performance.getEntriesByType('resource');
-        const extScripts = resources.filter(r => r.name.startsWith('chrome-extension://')).length;
-        // Also sum up ext script durations for cross-check
-        const extScriptMs = Math.round(
-          resources.filter(r => r.name.startsWith('chrome-extension://')).reduce((s,r) => s + r.duration, 0)
-        );
-        return { heap, loadTime, extScripts, extScriptMs };
-      }
-    });
-    const r = res?.[0]?.result;
-    return { heap: r?.heap ?? null, load: r?.loadTime ?? null, extScripts: r?.extScripts ?? null, extScriptMs: r?.extScriptMs ?? null };
-  } catch(e) {
-    return { heap: null, load: null, extScripts: null, extScriptMs: null };
-  }
+  send({ type: 'done', result: { items: results, testUrl, cancelled } });
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -881,3 +993,15 @@ async function runLiveMonitor(port) {
   // Start polling immediately after a short head start (500ms)
   pollTimer = setTimeout(poll, 500);
 }
+
+
+// Recovery: if the worker died mid Deep Scan, re-enable the extension it had disabled.
+(async () => {
+  try {
+    const { ds_disabled_id } = await chrome.storage.local.get('ds_disabled_id');
+    if (ds_disabled_id) {
+      chrome.management.setEnabled(ds_disabled_id, true, () => { void chrome.runtime.lastError; });
+      await chrome.storage.local.remove('ds_disabled_id');
+    }
+  } catch (e) {}
+})();

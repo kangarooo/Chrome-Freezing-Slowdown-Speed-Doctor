@@ -101,7 +101,7 @@ function renderProfiles() {
           <span class="profile-card-name">${escHtml(p.name)}</span>
           ${isActive ? '<span class="profile-active-badge">ACTIVE</span>' : ''}
           <span class="profile-card-meta">${enabledCount}/${p.items.length} on · ${date}</span>
-          <div class="profile-card-actions" onclick="event.stopPropagation()">
+          <div class="profile-card-actions" data-stop="1">
             <button class="btn-apply-profile" data-pid="${pid}">▶ Apply</button>
             <button class="btn-delete-profile" data-pid="${pid}">✕</button>
           </div>
@@ -387,7 +387,7 @@ function renderSearch(data) {
           <span class="status-pill ${item.enabled?'pill-on':'pill-off'}">${item.enabled?'ON':'OFF'}</span>
         </div>
       </div>
-      <div class="ext-card-actions" onclick="event.stopPropagation()">
+      <div class="ext-card-actions" data-stop="1">
         <button class="card-action-btn" data-action="details" data-id="${item.id}">⚙ Details</button>
         ${hasOptions ? `<button class="card-action-btn" data-action="options" data-id="${item.id}" data-options="${escHtml(item.optionsUrl)}">🔧 Options</button>` : ''}
         <span class="card-hint" style="margin-left:auto">${item.enabled?'Click card to disable':'Click card to enable'}</span>
@@ -418,7 +418,7 @@ function renderSearch(data) {
 
   function wireCards(root) {
     root.querySelectorAll('.ext-card').forEach(card => {
-      card.onclick = () => toggleItem(card.dataset.id, card.dataset.enabled === 'true');
+      card.onclick = e => { if (e.target.closest('[data-stop]')) return; toggleItem(card.dataset.id, card.dataset.enabled === 'true'); };
     });
     root.querySelectorAll('[data-action="details"]').forEach(btn => {
       btn.onclick = e => { e.stopPropagation(); chrome.tabs.create({ url: `chrome://extensions/?id=${btn.dataset.id}` }); };
@@ -952,27 +952,38 @@ let deepScanRunning = false;
 let cachedDeepResult = null;
 
 function startDeepScan() {
-  if (deepScanRunning) return;
+  if (deepScanRunning) {
+    // Button doubles as Cancel while a scan runs; the worker re-enables any disabled extension
+    try { deepScanPort && deepScanPort.postMessage({ type: 'cancel' }); } catch(e) {}
+    const b = document.getElementById('deepScanBtn');
+    if (b) { b.disabled = true; b.textContent = '⏳ Cancelling…'; }
+    return;
+  }
   deepScanRunning = true;
 
   const btn = document.getElementById('deepScanBtn');
   const eta = document.getElementById('deepScanEta');
-  btn.disabled = true;
-  btn.textContent = '⏳ Running…';
+  const urlInput = document.getElementById('deepScanUrl');
+  const testUrl = (urlInput?.value?.trim() || 'https://tvnet.lv');
 
-  // Estimate time from cached item count
+  btn.disabled = false;
+  btn.textContent = '⏹ Cancel scan';
+
   const itemCount = cachedData?.allItems?.filter(i => i.enabled && i.type !== 'theme').length || '?';
-  if (eta) eta.textContent = `~${typeof itemCount === 'number' ? Math.round(itemCount * 6) : '?'}s estimated`;
+  if (eta) eta.textContent = `~${typeof itemCount === 'number' ? Math.round(itemCount * 12) : '?'}s estimated`;
 
-  renderDeepScanLive(0, `Starting deep scan of ${itemCount} extensions…`, []);
+  renderDeepScanLive(0, `Starting deep scan of ${itemCount} extensions on ${testUrl}…`, []);
 
   deepScanPort = chrome.runtime.connect({ name: 'deep-scan' });
+
+  // Send config immediately after connecting
+  deepScanPort.postMessage({ type: 'config', testUrl });
 
   const liveItems = [];
 
   deepScanPort.onMessage.addListener(msg => {
     if (msg.type === 'start') {
-      renderDeepScanLive(0, 'Opening test tab…', liveItems);
+      renderDeepScanLive(0, `Scanning ${msg.total} extensions on ${msg.testUrl}…`, liveItems);
     } else if (msg.type === 'status') {
       renderDeepScanLive(msg.progress, msg.text, liveItems);
     } else if (msg.type === 'item_done') {
@@ -1058,101 +1069,150 @@ function renderDeepScanDone(result) {
   const c = document.getElementById('deep-scan-content');
   if (!c) return;
 
-  const { items, baseline } = result;
+  const { items, testUrl } = result;
   if (!items?.length) {
     c.innerHTML = `<div class="tip-box">No results — no enabled extensions found.</div>`;
     return;
   }
 
-  const maxHeap = Math.max(...items.map(i => Math.abs(i.heapDeltaBytes||0)), 1);
-  const maxLoad = Math.max(...items.map(i => Math.abs(i.loadDeltaMs||0)), 1);
-  const totalHeapMB = items.reduce((s, i) => s + (i.heapDeltaBytes||0), 0) / 1024 / 1024;
-  const topRam  = items.filter(i => (i.heapDeltaMB||0) > 0).slice(0, 3);
-  const topLoad = [...items].sort((a,b) => (b.loadDeltaMs||0)-(a.loadDeltaMs||0)).slice(0, 3);
+  // Helper: format delta value with sign, unit, color class
+  const fmtMBd  = v => v == null ? '—' : (v > 0 ? '+' : '') + v.toFixed(1) + ' MB';
+  const fmtMsd  = v => v == null ? '—' : (v > 0 ? '+' : '') + Math.round(v) + 'ms';
+  const fmtPctd = v => v == null ? '—' : (v > 0 ? '+' : '') + Math.round(v) + '%';
+  const fmtVal  = v => v == null ? '—' : (v > 0 ? '+' : '') + v;
 
-  // Build insights
+  const clsMB  = v => v == null ? 'info' : v > 20 ? 'danger' : v > 5 ? 'warn' : v > 0 ? 'ok' : 'info';
+  const clsMs  = v => v == null ? 'info' : v > 500 ? 'danger' : v > 150 ? 'warn' : v > 0 ? 'ok' : 'info';
+  const clsPct = v => v == null ? 'info' : v > 30 ? 'danger' : v > 10 ? 'warn' : v > 0 ? 'ok' : 'info';
+
+  // Insights
   const insights = [];
-  if (items[0]?.heapDeltaMB > 20) insights.push({ sev:'danger', text:`"${items[0].name}" adds ${items[0].heapDeltaMB.toFixed(1)} MB of RAM every page load — largest single cost.` });
-  if (totalHeapMB > 50)  insights.push({ sev:'danger', text:`All enabled extensions together add ~${totalHeapMB.toFixed(0)} MB of JS heap per page.` });
-  else if (totalHeapMB > 15) insights.push({ sev:'warn', text:`Extensions add ~${totalHeapMB.toFixed(0)} MB of JS heap per page in total.` });
-  const slowest = items.reduce((b,i) => (i.loadDeltaMs||0) > (b?.loadDeltaMs||0) ? i : b, null);
-  if (slowest?.loadDeltaMs > 500) insights.push({ sev:'danger', text:`"${slowest.name}" slows page load by ${slowest.loadDeltaMs}ms — disabling it could make pages noticeably faster.` });
-  else if (slowest?.loadDeltaMs > 150) insights.push({ sev:'warn', text:`"${slowest.name}" adds ${slowest.loadDeltaMs}ms to page load time.` });
-  if (baseline?.load) insights.push({ sev:'ok', text:`Baseline page load (all on): ${baseline.load}ms. Tab JS heap: ${(baseline.heap/1024/1024).toFixed(0)} MB.` });
-  if (!insights.length) insights.push({ sev:'ok', text:`Extensions appear lightweight — no single one adds significant RAM or load time.` });
+  const topActive = [...items].sort((a,b) => (b.activeHeapDeltaMB||0)-(a.activeHeapDeltaMB||0))[0];
+  const topLoad   = [...items].sort((a,b) => (b.loadTimeDeltaMs||0)-(a.loadTimeDeltaMs||0))[0];
+  const topCPU    = [...items].sort((a,b) => (b.loadCpuDeltaPct||0)-(a.loadCpuDeltaPct||0))[0];
+  const topLeak   = [...items].sort((a,b) => (b.retainedRamDeltaMB||0)-(a.retainedRamDeltaMB||0))[0];
+
+  if (topActive?.activeHeapDeltaMB > 20) insights.push({ sev:'danger', text:`"${topActive.name}" adds ${topActive.activeHeapDeltaMB.toFixed(1)} MB RAM while page is active.` });
+  if (topLoad?.loadTimeDeltaMs > 500)    insights.push({ sev:'danger', text:`"${topLoad.name}" slows page load by ${Math.round(topLoad.loadTimeDeltaMs)}ms.` });
+  else if (topLoad?.loadTimeDeltaMs > 150) insights.push({ sev:'warn', text:`"${topLoad.name}" adds ${Math.round(topLoad.loadTimeDeltaMs)}ms to page load.` });
+  if (topCPU?.loadCpuDeltaPct > 30)      insights.push({ sev:'danger', text:`"${topCPU.name}" uses ${Math.round(topCPU.loadCpuDeltaPct)}% extra CPU during page loading.` });
+  if (topLeak?.retainedRamDeltaMB > 5)   insights.push({ sev:'warn', text:`"${topLeak.name}" retains ${topLeak.retainedRamDeltaMB.toFixed(1)} MB RAM after tab closes — possible memory leak.` });
+  if (!insights.length) insights.push({ sev:'ok', text:'All extensions appear lightweight across all 4 phases. Good.' });
 
   let html = `
-  <div class="stress-interp" style="margin-top:10px">`;
+  <div style="font-size:10px;color:var(--muted);font-family:'Space Mono',monospace;margin-top:8px;margin-bottom:6px">
+    Tested on <strong style="color:var(--text)">${escHtml(testUrl)}</strong> · ${items.length} extension${items.length!==1?'s':''} · positive = extension adds cost
+  </div>
+  <div class="stress-interp">`;
   insights.forEach(i => {
-    const dot = i.sev==='danger' ? 'var(--danger)' : i.sev==='warn' ? 'var(--warn)' : 'var(--ok)';
+    const dot = i.sev==='danger'?'var(--danger)':i.sev==='warn'?'var(--warn)':'var(--ok)';
     html += `<div class="stress-insight"><div class="issue-dot" style="background:${dot};margin-top:3px;flex-shrink:0"></div><div class="issue-text">${i.text}</div></div>`;
   });
-  html += `</div>
+  html += `</div>`;
 
-  <div class="section-header" style="margin-top:14px">
-    <div class="section-title">Per-Extension RAM + Load Time (differential)</div>
-  </div>
-  <div class="stress-table-wrap">
-    <table class="ds-final-table">
-      <thead><tr>
-        <th style="width:28px"></th>
-        <th>Extension</th>
-        <th>RAM cost</th>
-        <th class="ds-bar-cell"></th>
-        <th>Load cost</th>
-        <th class="ds-bar-cell"></th>
-        <th></th>
-      </tr></thead>
-      <tbody>`;
+  // Phase legend
+  html += `
+  <div class="ds-phase-legend">
+    <div class="ds-pl-item"><span class="ds-pl-badge phase-a">A</span> <span>Idle — RAM with no tab</span></div>
+    <div class="ds-pl-item"><span class="ds-pl-badge phase-b">B</span> <span>Loading — CPU + heap during page load</span></div>
+    <div class="ds-pl-item"><span class="ds-pl-badge phase-c">C</span> <span>Active — heap while tab is open</span></div>
+    <div class="ds-pl-item"><span class="ds-pl-badge phase-d">D</span> <span>Closed — RAM retained after tab close</span></div>
+  </div>`;
+
+  // Main table
+  html += `
+  <div class="stress-table-wrap" style="margin-top:8px">
+  <table class="ds-final-table">
+    <thead><tr>
+      <th style="width:22px"></th>
+      <th>Extension</th>
+      <th class="ph-a" title="Phase A: Idle RAM">A · Idle</th>
+      <th class="ph-b" title="Phase B: CPU during load">B · CPU</th>
+      <th class="ph-b" title="Phase B: Load time">B · Load</th>
+      <th class="ph-b" title="Phase B: Heap at load end">B · Heap</th>
+      <th class="ph-c" title="Phase C: Heap while active">C · Active</th>
+      <th class="ph-d" title="Phase D: RAM retained after close">D · Leak</th>
+      <th></th>
+    </tr></thead>
+    <tbody>`;
+
+  // Max values for bar scaling per column
+  const maxA = Math.max(...items.map(i => Math.abs(i.idleRamDeltaMB||0)), 0.1);
+  const maxBt = Math.max(...items.map(i => Math.abs(i.loadTimeDeltaMs||0)), 1);
+  const maxBc = Math.max(...items.map(i => Math.abs(i.loadCpuDeltaPct||0)), 1);
+  const maxBh = Math.max(...items.map(i => Math.abs(i.loadHeapDeltaMB||0)), 0.1);
+  const maxC  = Math.max(...items.map(i => Math.abs(i.activeHeapDeltaMB||0)), 0.1);
+  const maxD  = Math.max(...items.map(i => Math.abs(i.retainedRamDeltaMB||0)), 0.1);
 
   items.forEach(item => {
-    const heapMB  = item.heapDeltaMB;
-    const loadMs  = item.loadDeltaMs;
-    const heapPct = maxHeap > 0 ? Math.round(Math.abs(item.heapDeltaBytes||0) / maxHeap * 100) : 0;
-    const loadPct = maxLoad > 0 ? Math.round(Math.abs(loadMs||0) / maxLoad * 100) : 0;
-    const heapCls = heapMB > 20 ? 'danger' : heapMB > 5 ? 'warn' : 'ok';
-    const loadCls = loadMs > 500 ? 'danger' : loadMs > 150 ? 'warn' : 'ok';
-    const iHtml   = safeIcon(item.icons, item.type, 16);
-
     const liveItem  = cachedData?.allItems?.find(i => i.id === item.id);
     const isEnabled = liveItem?.enabled ?? true;
+    const ic = safeIcon(item.icons, item.type, 16);
 
-    html += `<tr class="ds-toggle-row" data-id="${item.id}" data-enabled="${isEnabled}" style="cursor:pointer" title="${isEnabled?'Click row to disable':'Click row to enable'}">
-      <td><div style="width:20px;height:20px;border-radius:4px;background:var(--surface2);border:1px solid var(--border);display:flex;align-items:center;justify-content:center;overflow:hidden">${iHtml}</div></td>
-      <td style="max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:11px;font-weight:500">${escHtml(item.name)}</td>
-      <td><span style="font-family:'Space Mono',monospace;font-size:11px;font-weight:700" class="${heapCls}">${heapMB != null ? (heapMB > 0 ? '+' : '') + heapMB.toFixed(1) + ' MB' : '—'}</span></td>
-      <td class="ds-bar-cell"><div class="ds-mini-bar"><div class="ds-mini-fill ${heapCls}" style="width:${heapPct}%"></div></div></td>
-      <td><span style="font-family:'Space Mono',monospace;font-size:11px;font-weight:700" class="${loadCls}">${loadMs != null ? (loadMs > 0 ? '+' : '') + loadMs + 'ms' : '—'}</span></td>
-      <td class="ds-bar-cell"><div class="ds-mini-bar"><div class="ds-mini-fill ${loadCls}" style="width:${loadPct}%"></div></div></td>
-      <td onclick="event.stopPropagation()"><button class="toggle-btn ${isEnabled?'btn-disable':'btn-enable'}" data-id="${item.id}" data-enabled="${isEnabled}" style="font-size:8px;padding:2px 7px">${isEnabled?'Disable':'Enable'}</button></td>
+    // Severity class per cell
+    const aV  = item.idleRamDeltaMB;
+    const bCv = item.loadCpuDeltaPct;
+    const bTv = item.loadTimeDeltaMs;
+    const bHv = item.loadHeapDeltaMB;
+    const cV  = item.activeHeapDeltaMB;
+    const dV  = item.retainedRamDeltaMB;
+
+    // Worst phase for row highlight
+    const worst = [
+      clsMB(aV), clsPct(bCv), clsMs(bTv), clsMB(bHv), clsMB(cV), clsMB(dV)
+    ].includes('danger') ? 'danger' : [
+      clsMB(aV), clsPct(bCv), clsMs(bTv), clsMB(bHv), clsMB(cV), clsMB(dV)
+    ].includes('warn') ? 'warn' : '';
+
+    // Mini bar helper
+    const bar = (val, max, cls) => {
+      const pct = Math.min(100, Math.round(Math.abs(val||0) / max * 100));
+      return `<div class="ds-mini-bar" style="width:44px"><div class="ds-mini-fill ${cls}" style="width:${pct}%"></div></div>`;
+    };
+
+    html += `
+    <tr class="ds-toggle-row" data-id="${item.id}" data-enabled="${isEnabled}"
+        style="cursor:pointer${worst==='danger'?';border-left:2px solid var(--danger)':worst==='warn'?';border-left:2px solid var(--warn)':''}"
+        title="${isEnabled?'Click to disable':'Click to enable'}">
+      <td><div style="width:18px;height:18px;border-radius:3px;overflow:hidden;display:flex;align-items:center;justify-content:center;background:var(--surface2)">${ic}</div></td>
+      <td class="ds-name-cell">${escHtml(item.name)}</td>
+      <td class="ph-a"><span class="ds-val ${clsMB(aV)}">${fmtMBd(aV)}</span>${bar(aV,maxA,clsMB(aV))}</td>
+      <td class="ph-b"><span class="ds-val ${clsPct(bCv)}">${fmtPctd(bCv)}</span>${bar(bCv,maxBc,clsPct(bCv))}</td>
+      <td class="ph-b"><span class="ds-val ${clsMs(bTv)}">${fmtMsd(bTv)}</span>${bar(bTv,maxBt,clsMs(bTv))}</td>
+      <td class="ph-b"><span class="ds-val ${clsMB(bHv)}">${fmtMBd(bHv)}</span>${bar(bHv,maxBh,clsMB(bHv))}</td>
+      <td class="ph-c"><span class="ds-val ${clsMB(cV)}">${fmtMBd(cV)}</span>${bar(cV,maxC,clsMB(cV))}</td>
+      <td class="ph-d"><span class="ds-val ${clsMB(dV)}">${fmtMBd(dV)}</span>${bar(dV,maxD,clsMB(dV))}</td>
+      <td data-stop="1" style="white-space:nowrap">
+        <button class="toggle-btn ${isEnabled?'btn-disable':'btn-enable'}" data-id="${item.id}" data-enabled="${isEnabled}" style="font-size:8px;padding:2px 7px">${isEnabled?'Disable':'Enable'}</button>
+      </td>
     </tr>`;
   });
 
   html += `</tbody></table></div>
   <div class="tip-box" style="margin-top:6px">
-    <strong>How to read:</strong> RAM cost = JS heap added by this extension per page load.
-    Load cost = milliseconds added to page load time. Measured by disabling each extension and reloading google.com.
+    <strong>A·Idle</strong> = RAM used with no tab open &nbsp;|&nbsp;
+    <strong>B·CPU</strong> = extra CPU% during load &nbsp;|&nbsp;
+    <strong>B·Load</strong> = ms added to page load &nbsp;|&nbsp;
+    <strong>B·Heap</strong> = heap at load end &nbsp;|&nbsp;
+    <strong>C·Active</strong> = heap while tab is open &nbsp;|&nbsp;
+    <strong>D·Leak</strong> = RAM not freed after close
   </div>`;
 
   c.innerHTML = html;
-  wireToggleBtnsStandalone(c);
 
-  // Wire whole-row click for deep scan table
+  wireToggleBtnsStandalone(c);
   c.querySelectorAll('.ds-toggle-row').forEach(row => {
-    row.onclick = () => {
+    row.onclick = e => {
+      if (e.target.closest('[data-stop]')) return;
       const id = row.dataset.id;
-      const currentlyEnabled = row.dataset.enabled === 'true';
-      const newEnabled = !currentlyEnabled;
-      row.dataset.enabled = String(newEnabled);
-      row.title = newEnabled ? 'Click row to disable' : 'Click row to enable';
-      row.style.opacity = newEnabled ? '' : '0.5';
+      const cur = row.dataset.enabled === 'true';
+      const nw = !cur;
+      row.dataset.enabled = String(nw);
+      row.title = nw ? 'Click to disable' : 'Click to enable';
+      row.style.opacity = nw ? '' : '0.5';
       const btn = row.querySelector('.toggle-btn');
-      if (btn) {
-        btn.dataset.enabled = String(newEnabled);
-        btn.textContent = newEnabled ? 'Disable' : 'Enable';
-        btn.className = `toggle-btn ${newEnabled ? 'btn-disable' : 'btn-enable'}`;
-      }
-      toggleItem(id, currentlyEnabled);
+      if (btn) { btn.dataset.enabled = String(nw); btn.textContent = nw?'Disable':'Enable'; btn.className=`toggle-btn ${nw?'btn-disable':'btn-enable'}`; }
+      toggleItem(id, cur);
     };
   });
 }
@@ -1444,7 +1504,7 @@ function renderStressDone(result) {
             <span class="eic-bar-val">${item.permScore}</span>
           </div>
         </div>
-        <div class="eic-actions" onclick="event.stopPropagation()">
+        <div class="eic-actions" data-stop="1">
           <button class="toggle-btn ${isEnabled?'btn-disable':'btn-enable'}" data-id="${item.id}" data-enabled="${isEnabled}">${isEnabled?'Disable':'Enable'}</button>
           <button class="card-action-btn" data-action="details" data-id="${item.id}">⚙ Details</button>
           <span class="status-pill ${isEnabled?'pill-on':'pill-off'}" style="margin-left:auto">${isEnabled?'ON':'OFF'}</span>
@@ -1479,7 +1539,8 @@ function renderStressDone(result) {
 
   // Wire whole-card click = toggle
   c.querySelectorAll('.ext-impact-card').forEach(card => {
-    card.onclick = () => {
+    card.onclick = e => {
+      if (e.target.closest('[data-stop]')) return;
       const id = card.dataset.id;
       const enabled = card.dataset.enabled === 'true';
       const newEnabled = !enabled;
@@ -1573,3 +1634,4 @@ document.addEventListener('DOMContentLoaded', () => {
     });
   });
 });
+

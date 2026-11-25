@@ -1,20 +1,3 @@
-# Chrome-Freezing-Slowdown-Speed-Doctor
-
-
-![License: Proprietary](https://img.shields.io/badge/License-Proprietary-red.svg)
-
-## License
-
-Copyright (c) 2026 [Jānis Ķengurs]. All rights reserved.
-
-This software and its source code are proprietary and confidential.
-Unauthorized copying, modification, distribution, sublicensing, or
-commercial use of this software, in whole or in part, is strictly
-prohibited without prior written permission from the copyright owner.
-
-For licensing or partnership inquiries, contact: [kangarooo@gmail.com]
-
-
 # Chrome Speed Doctor
 
 **Find what's slowing your browser — real per-process CPU, RAM, extension impact, tab heap usage, and more.**
@@ -110,6 +93,8 @@ The `debugger` permission is what causes Chrome to show the **"Speed Doctor is d
 | v1.8.2 | Button Fix | Missing `stressPort`/`stressRunning` declarations restored |
 | v1.8.3 | Stress Toggle | Stress test card row click-to-toggle, enable/disable button fixed |
 | v1.8.4 | Toggle Fix | Deep scan row click-to-toggle, all panel buttons update in-place |
+| v1.9.0 | Deep Scan Reborn | 4-phase Deep Scan (idle / loading / active / closed-leak), configurable test URL |
+| v1.10.0 | Safety Net | Deep Scan can be cancelled; extensions are always re-enabled (even if the worker dies); removed inline onclick handlers (CSP-clean); clicks on action buttons no longer trigger row toggle |
 
 ---
 

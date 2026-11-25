@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Chrome Speed Doctor",
-  "version": "1.8.4",
+  "version": "1.10.0",
   "description": "Find what's slowing Chrome — real per-process CPU via CDP, RAM, extensions, apps, tabs.",
   "permissions": [
     "tabs",
