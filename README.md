@@ -95,6 +95,7 @@ The `debugger` permission is what causes Chrome to show the **"Speed Doctor is d
 | v1.8.4 | Toggle Fix | Deep scan row click-to-toggle, all panel buttons update in-place |
 | v1.9.0 | Deep Scan Reborn | 4-phase Deep Scan (idle / loading / active / closed-leak), configurable test URL |
 | v1.10.0 | Safety Net | Deep Scan can be cancelled; extensions are always re-enabled (even if the worker dies); removed inline onclick handlers (CSP-clean); clicks on action buttons no longer trigger row toggle |
+| v1.10.1 | Live Heartbeat | Live Monitor no longer stalls: every debugger call has a timeout, poll loop always reschedules and reports errors |
 
 ---
 

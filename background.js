@@ -113,22 +113,30 @@ async function measureTabMemory(tabs) {
 // CDP HELPERS — real CPU time per process via Performance.getMetrics
 // ═══════════════════════════════════════════════════════════════════════════════
 
-function cdpSend(target, method, params = {}) {
-  return new Promise((resolve, reject) => {
+function withTimeout(p, ms, label = 'op') {
+  let t;
+  return Promise.race([
+    p,
+    new Promise((_, rej) => { t = setTimeout(() => rej(new Error(label + ' timed out')), ms); })
+  ]).finally(() => clearTimeout(t));
+}
+
+function cdpSend(target, method, params = {}, timeoutMs = 3000) {
+  return withTimeout(new Promise((resolve, reject) => {
     chrome.debugger.sendCommand(target, method, params, result => {
       if (chrome.runtime.lastError) reject(new Error(chrome.runtime.lastError.message));
       else resolve(result);
     });
-  });
+  }), timeoutMs, method);
 }
 
 function cdpAttach(target) {
-  return new Promise((resolve, reject) => {
+  return withTimeout(new Promise((resolve, reject) => {
     chrome.debugger.attach(target, '1.3', () => {
       if (chrome.runtime.lastError) reject(new Error(chrome.runtime.lastError.message));
       else resolve();
     });
-  });
+  }), 3000, 'attach');
 }
 
 // Safe detach — never throws, silently ignores "not attached" errors
@@ -142,7 +150,7 @@ function cdpDetach(target) {
 }
 
 function getDebugTargets() {
-  return new Promise(resolve => chrome.debugger.getTargets(resolve));
+  return withTimeout(new Promise(resolve => chrome.debugger.getTargets(t => resolve(t || []))), 3000, 'getTargets').catch(() => []);
 }
 
 // Check if a target belongs to a specific extension ID
@@ -917,9 +925,10 @@ async function runLiveMonitor(port) {
   async function poll() {
     if (!alive) return;
     tickCount++;
+    try {
 
     // Re-discover new tabs/extensions every 5 ticks (10s), non-blocking
-    if (tickCount % 5 === 0) discoverAndAttach();
+    if (tickCount % 5 === 0) discoverAndAttach().catch(() => {});
 
     // Poll all sessions in parallel
     const results = (await Promise.allSettled(
@@ -979,14 +988,19 @@ async function runLiveMonitor(port) {
       sessionCount: sessions.size,
     });
 
-    if (alive) pollTimer = setTimeout(poll, POLL_MS);
+    } catch (err) {
+      console.log('[Live] poll error:', err && err.message);
+      send({ type: 'tick', processes: [], sysCpu: null, sysMemPct: null, sysMemFreeMB: null, sessionCount: sessions.size, error: String(err && err.message) });
+    } finally {
+      if (alive) pollTimer = setTimeout(poll, POLL_MS);
+    }
   }
 
   // ── Start: send ready immediately, attach in background, start polling ────
   send({ type: 'ready', count: 0 });
 
   // Fire off discovery without awaiting — first tick will have whatever attached fast
-  discoverAndAttach().then(() => {
+  discoverAndAttach().catch(e => console.log('[Live] discover error:', e && e.message)).then(() => {
     if (alive) send({ type: 'attached', count: sessions.size });
   });
 
