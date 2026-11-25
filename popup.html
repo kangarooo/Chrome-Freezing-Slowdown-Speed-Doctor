@@ -423,6 +423,18 @@
   .phase-b{background:rgba(255,170,0,.15);color:var(--warn)}
   .phase-c{background:rgba(0,204,102,.15);color:var(--ok)}
   .phase-d{background:rgba(255,51,85,.15);color:var(--danger)}
+  .wd-top{display:flex;align-items:center;gap:10px;padding:10px;background:var(--surface);border:1px solid var(--border);border-radius:8px;margin-bottom:8px}
+  .wd-top .grow{flex:1;font-size:11px;color:var(--muted)}
+  .wd-btn{background:var(--surface2);border:1px solid var(--border);color:var(--text);border-radius:6px;padding:5px 10px;font-size:10px;cursor:pointer;font-family:'Space Mono',monospace}
+  .wd-btn.on{background:rgba(0,204,102,.15);border-color:var(--ok);color:var(--ok)}
+  .wd-sus{display:flex;align-items:center;gap:8px;padding:6px 8px;border:1px solid var(--border);border-radius:6px;margin-bottom:4px;background:var(--surface)}
+  .wd-sus .nm{flex:1;font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .wd-sus .meta{font-size:9px;color:var(--muted)}
+  .wd-sus .sc{font-family:'Space Mono',monospace;font-size:12px;min-width:34px;text-align:right}
+  .wd-sus.top{border-color:var(--danger)}
+  .wd-h{font-size:10px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);margin:10px 0 5px}
+  .wd-ev{font-family:'Space Mono',monospace;font-size:9px;padding:3px 6px;border-bottom:1px solid var(--border);display:flex;gap:8px}
+  .wd-ev.hang{color:var(--danger)}
 </style>
 </head>
 <body>
@@ -451,6 +463,7 @@
 <div class="nav-tabs">
   <div class="nav-tab active" id="tab-search"     data-tab="search">🔍 Search</div>
   <div class="nav-tab"        id="tab-live"       data-tab="live">📡 Live</div>
+  <div class="nav-tab"        id="tab-watchdog"   data-tab="watchdog">🐕 Watchdog</div>
   <div class="nav-tab"        id="tab-profiles"   data-tab="profiles">💾 Profiles</div>
   <div class="nav-tab"        id="tab-diagnosis"  data-tab="diagnosis">🩺 Diagnosis</div>
   <div class="nav-tab"        id="tab-stress"     data-tab="stress">🔬 Stress Test</div>
@@ -467,6 +480,7 @@
   <div class="panel" id="panel-live">
     <div class="empty-state"><div class="icon">📡</div><p>Switch to this tab to start live monitoring</p></div>
   </div>
+  <div class="panel" id="panel-watchdog"></div>
   <div class="panel" id="panel-profiles">
     <div class="empty-state"><div class="icon">💾</div><p>Run a scan first, then save profiles here</p></div>
   </div>

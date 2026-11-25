@@ -222,6 +222,7 @@ function switchTab(name) {
   document.getElementById('tab-'+name).classList.add('active');
   document.getElementById('panel-'+name).classList.add('active');
 
+  if (name === 'watchdog') loadWatchdog();
   if (name === 'live') {
     startLiveMonitor();
   } else {
@@ -1635,3 +1636,64 @@ document.addEventListener('DOMContentLoaded', () => {
   });
 });
 
+
+
+// ═══ WATCHDOG ═══════════════════════════════════════════════════════════════
+function loadWatchdog() {
+  chrome.runtime.sendMessage({ type: 'WD_GET' }, r => {
+    if (chrome.runtime.lastError || !r || r.error) return;
+    renderWatchdog(r);
+  });
+}
+
+function renderWatchdog(r) {
+  const panel = document.getElementById('panel-watchdog');
+  if (!panel) return;
+  // Add Deep Scan evidence if the user has run one
+  const deep = {};
+  (cachedDeepResult?.items || []).forEach(d => { deep[d.id] = d; });
+  const sus = r.suspects.map(s => {
+    const d = deep[s.id];
+    let bonus = 0; const notes = [];
+    if (d) {
+      if ((d.loadTimeDeltaMs || 0) > 150) { bonus += 3; notes.push(`+${d.loadTimeDeltaMs}ms page load`); }
+      if ((d.loadCpuDeltaPct || 0) > 10) { bonus += 2; notes.push(`+${d.loadCpuDeltaPct}% CPU on load`); }
+      if ((d.retainedRamDeltaMB || 0) > 30) { bonus += 2; notes.push(`${d.retainedRamDeltaMB}MB kept after close`); }
+    }
+    return { ...s, score: Math.round((s.score + bonus) * 10) / 10, notes };
+  }).sort((a, b) => b.score - a.score);
+
+  const top = sus.slice(0, 8);
+  const hangPct = r.total ? Math.round(r.hangs / r.total * 100) : 0;
+  panel.innerHTML = `
+    <div class="wd-top">
+      <button class="wd-btn ${r.enabled ? 'on' : ''}" id="wdToggle">${r.enabled ? '● Watching' : '○ Start watching'}</button>
+      <div class="grow">${r.enabled
+        ? 'Keep working normally — open and close tabs. Hang-like moments are logged and blamed on the extensions active there.'
+        : 'Turn on, then use Chrome as usual. It measures how long Chrome takes to respond right after every tab open / close / navigation.'}</div>
+      <button class="wd-btn" id="wdClear">Clear</button>
+    </div>
+    <div class="wd-h">Prime suspects ${r.total ? `· ${r.hangs}/${r.total} events hung (${hangPct}%)` : ''}</div>
+    ${top.map((s, i) => `
+      <div class="wd-sus ${i === 0 && s.score >= 6 ? 'top' : ''}">
+        ${safeIcon(s.icons, s.type, 18)}
+        <div class="nm">${escHtml(s.name)}<div class="meta">${s.hangsSeen}/${s.eventsSeen} hung on its tabs · risk: ${escHtml(s.riskWhy.join(', ') || 'low')}${s.notes.length ? ' · ' + escHtml(s.notes.join(', ')) : ''}</div></div>
+        <div class="sc">${s.score}</div>
+        <button class="wd-btn" data-wd-off="${s.id}">Disable</button>
+      </div>`).join('') || '<div class="tip-box">No data yet.</div>'}
+    <div class="tip-box" style="margin-top:6px">Tip: disable the top suspect, keep working a few minutes, and see if the hang % drops. Scores combine permission risk (webRequest, all-sites access…) with real hang evidence${Object.keys(deep).length ? ' and your last Deep Scan' : '; run a Deep Scan to add load/CPU/leak evidence'}.</div>
+    <div class="wd-h">Recent events</div>
+    ${r.events.slice(0, 25).map(e => `<div class="wd-ev ${e.hang ? 'hang' : ''}">
+      <span>${new Date(e.t).toLocaleTimeString()}</span><span>${e.kind}</span><span style="flex:1;overflow:hidden;text-overflow:ellipsis">${escHtml(e.host || '')}</span>
+      <span>lag ${e.lagMs}ms</span><span>cpu ${e.cpu ?? '—'}%</span></div>`).join('') || '<div class="meta" style="color:var(--muted);font-size:10px">No events yet.</div>'}`;
+
+  document.getElementById('wdToggle').onclick = () =>
+    chrome.runtime.sendMessage({ type: 'WD_SET', enabled: !r.enabled }, loadWatchdog);
+  document.getElementById('wdClear').onclick = () =>
+    chrome.runtime.sendMessage({ type: 'WD_CLEAR' }, loadWatchdog);
+  panel.querySelectorAll('[data-wd-off]').forEach(b => {
+    b.onclick = () => chrome.runtime.sendMessage({ type: 'TOGGLE_ITEM', id: b.dataset.wdOff, enable: false }, () => {
+      b.textContent = 'Disabled'; b.disabled = true;
+    });
+  });
+}

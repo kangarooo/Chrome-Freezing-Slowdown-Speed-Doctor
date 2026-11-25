@@ -1,4 +1,5 @@
 // Chrome Speed Doctor — background service worker
+importScripts('watchdog.js');
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg.type === 'GET_DATA') {
@@ -9,6 +10,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     toggleItem(msg.id, msg.enable).then(sendResponse).catch(err => sendResponse({ error: err.message }));
     return true;
   }
+  if (msg.type === 'WD_GET') { wdGetReport().then(sendResponse).catch(err => sendResponse({ error: err.message })); return true; }
+  if (msg.type === 'WD_SET') { chrome.storage.local.set({ wd_enabled: !!msg.enabled }).then(() => sendResponse({ ok: true })); return true; }
+  if (msg.type === 'WD_CLEAR') { chrome.storage.local.remove('wd_events').then(() => sendResponse({ ok: true })); return true; }
   if (msg.type === 'GET_TARGETS_DEBUG') {
     // Returns raw target list for diagnosing live monitor issues
     const self = chrome.runtime.id;
